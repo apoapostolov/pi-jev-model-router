@@ -153,6 +153,8 @@ export interface JevRouterConfig {
   /** Don't switch models when the current model already sits on the chosen tier. */
   stickiness: boolean;
   stateFile: string;
+  /** Same-turn failover and temporary model parking. Disabled unless opted in. */
+  recovery: { enabled: boolean; parkMs: number; maxRetries: number };
   routes: Record<Tier, RouteChain>;
   /**
    * Kind-specific model preferences. When a kind has a chain here, models are
@@ -202,6 +204,7 @@ export const DEFAULT_CONFIG: JevRouterConfig = {
   confidenceThreshold: 0.34,
   stickiness: true,
   stateFile: join(homedir(), CONFIG_DIR_NAME, "agent", "pi-jev-model-router-state.json"),
+  recovery: { enabled: false, parkMs: 3_600_000, maxRetries: 2 },
   routes: {
     quick: [
       { provider: "openrouter", model: "~google/gemini-flash-latest", thinkingLevel: "off" },
@@ -445,6 +448,15 @@ function merge(base: JevRouterConfig, patch: unknown): JevRouterConfig {
   return {
     ...base,
     ...(p as Partial<JevRouterConfig>),
+    recovery: {
+      enabled: typeof asRecord(p.recovery).enabled === "boolean" ? asRecord(p.recovery).enabled as boolean : base.recovery.enabled,
+      maxRetries: Number.isInteger(asRecord(p.recovery).maxRetries) &&
+        (asRecord(p.recovery).maxRetries as number) >= 0 && (asRecord(p.recovery).maxRetries as number) <= 5
+        ? asRecord(p.recovery).maxRetries as number : base.recovery.maxRetries,
+      parkMs: typeof asRecord(p.recovery).parkMs === "number" && Number.isFinite(asRecord(p.recovery).parkMs) &&
+        (asRecord(p.recovery).parkMs as number) >= 60_000 && (asRecord(p.recovery).parkMs as number) <= 86_400_000
+        ? asRecord(p.recovery).parkMs as number : base.recovery.parkMs,
+    },
     routes,
     kindModels,
     taskKinds,

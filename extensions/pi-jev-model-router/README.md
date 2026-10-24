@@ -30,7 +30,8 @@ your spend caps never invalidates the judgment, and the judgment stays a pure
 semantic read of the request.
 
 See the [root README](../../README.md) for the full configuration reference,
-ranking, expensive-tier confirmations, and Codex quota guards.
+ranking, expensive-tier confirmations, Codex quota guards, and opt-in same-turn
+model recovery.
 
 ## What you see
 
@@ -126,7 +127,7 @@ is `~/.pi/agent/pi-jev-model-router.generated.json`, written by
   "free": {
     "enabled": false,
     "policy": "prefer",
-    "pool": [{ "provider": "opencode-go", "model": "space-bunny-free", "thinkingLevel": "medium" }]
+    "pool": [{ "provider": "opencode-go", "model": "longcat-2.5-preview-free", "thinkingLevel": "medium" }]
   }
 }
 ```

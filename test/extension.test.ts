@@ -70,12 +70,13 @@ async function load(options: { minimal?: boolean; answer?: string | undefined; s
   const dialogs: Array<{ title: string; placeholder?: string; opts?: unknown; options?: string[] }> = [];
   let answer = options.answer;
   const selectAnswer = options.select;
+  const entries: Array<{ type: string; data: unknown }> = [];
   const fake: Record<string, unknown> = { on: (event: string, handler: Handler) => handlers.set(event, handler) };
   if (!options.minimal) {
     Object.assign(fake, {
       registerCommand: (name: string, command: Command) => commands.set(name, command),
       registerTool: () => {},
-      appendEntry: () => {},
+      appendEntry: (type: string, data: unknown) => entries.push({ type, data }),
       setModel: async (model: unknown) => (setModel.push(model), true),
       setThinkingLevel: (level: unknown) => thinking.push(level),
     });
@@ -111,7 +112,10 @@ async function load(options: { minimal?: boolean; answer?: string | undefined; s
   if (options.token) await new Promise((resolve) => setTimeout(resolve, 0));
   const input = (text: string, source = "interactive") => handlers.get("input")!({ text, source }, ctx);
   const command = (name: string, args = "") => commands.get(name)!.handler(args, ctx);
-  return { input, command, notes, setModel, thinking, dialogs, setAnswer: (v: string | undefined) => { answer = v } };
+  const turnEnd = (message: unknown, messageEntryId = "failed-entry", toolResults: unknown[] = []) => handlers.get("turn_end")?.({
+    message, messageEntryId, toolResults, outcome: "error", turnIndex: 0,
+  }, ctx);
+  return { input, turnEnd, command, notes, entries, setModel, thinking, dialogs, setAnswer: (v: string | undefined) => { answer = v } };
 }
 
 beforeEach(() => {
@@ -132,6 +136,75 @@ afterEach(async () => {
 afterAll(() => rmSync(home, { recursive: true, force: true }));
 
 describe("pi extension", () => {
+  test("fails over the same turn on a withdrawn model and parks it for later prompts and sessions", async () => {
+    writeProjectConfig({ apiKey: "test-key", recovery: { enabled: true, parkMs: 3600000 } });
+    stubFetch(() => Response.json(jevAnswers("implement", 1)));
+    const first = await load();
+    await first.input("implement a working client for this endpoint");
+    const result = await first.turnEnd({ role: "assistant", provider: "testprov", model: "std-a", stopReason: "error", errorMessage: "404 model std-a not found" });
+    expect(result).toEqual({ entries: [{ type: "context_edit", targetId: "failed-entry", replacement: null }], continue: true });
+    expect(first.setModel.at(-1)).toMatchObject({ provider: "testprov", id: "quick-a" });
+    const second = await load({ current: models[1] });
+    await second.input("yes");
+    expect(second.setModel.at(-1)).toMatchObject({ provider: "testprov", id: "quick-a" });
+  });
+
+  test("tries each alternative at most once and never replays after tool results", async () => {
+    writeProjectConfig({ apiKey: "test-key", recovery: { enabled: true } });
+    stubFetch(() => Response.json(jevAnswers("implement", 1)));
+    const run = await load();
+    await run.input("implement a working client for this endpoint");
+    const failed = (id: string) => ({ role: "assistant", provider: "testprov", model: id, stopReason: "error", errorMessage: `404 model ${id} not found` });
+    expect(await run.turnEnd(failed("std-a"))).toHaveProperty("continue", true);
+    expect(await run.turnEnd(failed("quick-a"))).toBeUndefined();
+    expect(await run.turnEnd(failed("std-a"))).toBeUndefined();
+    expect(run.setModel.map((model) => (model as { id: string }).id)).toEqual(["std-a", "quick-a"]);
+  });
+
+  test("after the initial request and two retries, switches within the same turn", async () => {
+    writeProjectConfig({ apiKey: "test-key", recovery: { enabled: true } });
+    stubFetch(() => Response.json(jevAnswers("implement", 1)));
+    const run = await load();
+    await run.input("implement a working client for this endpoint");
+    const failure = { role: "assistant", provider: "testprov", model: "std-a", stopReason: "error", errorMessage: "503 service unavailable" };
+    expect(await run.turnEnd(failure)).toBeUndefined();
+    expect(await run.turnEnd(failure)).toBeUndefined();
+    expect(await run.turnEnd(failure)).toHaveProperty("continue", true);
+    expect(run.setModel.at(-1)).toMatchObject({ id: "quick-a" });
+  });
+
+  test("a configured retry count overrides the default", async () => {
+    writeProjectConfig({ apiKey: "test-key", recovery: { enabled: true, maxRetries: 1 } });
+    stubFetch(() => Response.json(jevAnswers("implement", 1)));
+    const run = await load();
+    await run.input("implement a working client for this endpoint");
+    const failure = { role: "assistant", provider: "testprov", model: "std-a", stopReason: "error", errorMessage: "503 service unavailable" };
+    expect(await run.turnEnd(failure)).toBeUndefined();
+    expect(await run.turnEnd(failure)).toHaveProperty("continue", true);
+  });
+
+  test("never replays a turn with tool effects", async () => {
+    writeProjectConfig({ apiKey: "test-key", recovery: { enabled: true } });
+    stubFetch(() => Response.json(jevAnswers("implement", 1)));
+    const run = await load();
+    await run.input("implement a working client for this endpoint");
+    // The fake dispatch below represents a turn in which a tool already ran.
+    const result = await run.turnEnd({ role: "assistant", provider: "testprov", model: "std-a", stopReason: "error", errorMessage: "404 model not found" }, "failed-entry", [{ role: "toolResult" }]);
+    expect(result).toBeUndefined();
+  });
+
+  test("never retries a failed turn on an unrelated error or with no alternative", async () => {
+    writeProjectConfig({ apiKey: "test-key", recovery: { enabled: true }, routes: { quick: [], standard: [{ provider: "testprov", model: "std-a" }], high: [], premium: [] } });
+    stubFetch(() => Response.json(jevAnswers("implement", 1)));
+    const run = await load();
+    await run.input("implement a working client for this endpoint");
+    expect(await run.turnEnd({ role: "assistant", provider: "testprov", model: "std-a", stopReason: "error", errorMessage: "bad JSON" })).toBeUndefined();
+    expect(await run.turnEnd({ role: "assistant", provider: "testprov", model: "std-a", stopReason: "error", errorMessage: "404 model std-a not found" })).toBeUndefined();
+    const next = await load({ current: models[1] });
+    expect(await next.input("yes")).toEqual({ action: "handled" });
+    expect(next.notes.some(([note]) => note.includes("prompt not sent"))).toBe(true);
+  });
+
   test("routes a prompt end to end: switches to the judged tier model and pins its thinking level", async () => {
     stubFetch(() => Response.json(jevAnswers("implement", 1)));
     const { input, setModel, thinking } = await load();

@@ -12,7 +12,7 @@ policy, and pi switches to the matching model.
 
 - **Task-aware** — planning goes to reasoners, implementation to coding specialists, chat to cheap fast models.
 - **Budget-aware** — daily/monthly caps downgrade tiers automatically instead of overspending.
-- **Resilient** — each tier is a candidate chain; if a model is unavailable or unauthenticated, the next one is used.
+- **Resilient** — each tier is a candidate chain. Optional recovery parks models withdrawn after selection and continues the same turn on a fallback.
 - **Visible** — the transcript records the chosen model and the exact reason (kind, complexity, capability, reasoning, budget pressure).
 - **Fails open by default** — a missing key, timeout, or unknown model warns and keeps the current model; opt-in quota protection can stop submission to an ineligible model.
 
@@ -127,6 +127,7 @@ disabled. No configuration is required — sensible defaults are built in.
 | `/jev-router budget monthly 150` | Session-only monthly cap |
 | `/jev-router why` | Re-run Jev on the last prompt and show the full judgment + decision trace |
 | `/jev-router revert` | Switch back to the model that was active before the last auto-switch |
+| `/jev-router recovery` / `recovery clear` | Show expiring model parks or clear them |
 | `/jev-router suggest` | Rank your scored models into proposed `routes` / `kindModels` and print them (see [Ranking models from your own scores](#ranking-models-from-your-own-scores)) |
 | `/jev-router suggest --write` | Same, and save it as a generated config layer that your own config overrides |
 | `/jev-route <text>` | Classify arbitrary text and show the recommendation without switching |
@@ -159,6 +160,12 @@ jev-router · not routed
 acknowledgement — staying on the current model
 using openrouter/~anthropic/claude-opus-latest
 ```
+
+## Same-turn recovery
+
+Enable it with `"recovery": { "enabled": true }` in `~/.pi/agent/pi-jev-model-router.json`. The optional `parkMs` defaults to 3600000 (one hour; allowed range one minute to one day). `maxRetries` defaults to 2 (allowed range 0 to 5). On a model-specific unavailable response, or after the initial request plus two retries fail on the same model, Pi omits the failed assistant reply from model context, switches to the next eligible model at the approved tier or lower, and continues the **existing** user turn. It does not send the prompt again as a new user message or ask Jev to classify it again. The failed response stays in the raw transcript for diagnosis.
+
+The failed provider/model is parked in a separate `<stateFile>.parked.json` overlay and excluded from later routing until expiry, including after restart. The hand-edited route table is never rewritten. `/jev-router recovery` shows active parks; `/jev-router recovery clear` removes them. Recovery is off by default and only runs when routing is enabled and the mode can switch models. It never replays a turn after tools ran, never escalates above the approved tier, and never parks a model for authentication or context overflow. Repeated 429 and 5xx errors can park a model after the configured number of retries. Pi's own `retry.enabled` must be on and `retry.maxRetries` must be at least `recovery.maxRetries` for that path to reach the fallback. If there is no safe fallback or model switching fails, the original error remains visible. This needs Pi 1.4.0's actionable `turn_end` hook.
 
 ## Which models it uses by default
 

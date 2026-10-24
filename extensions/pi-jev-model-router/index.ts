@@ -28,6 +28,7 @@ import {
   type Ledger,
 } from "./budget";
 import { classifyRequest, JevError, type RouteAnalysis } from "./jev";
+import { modelUnavailable, parkedPath, readParked, retryableProviderFailure, writeParked } from "./recovery";
 import {
   decide,
   eligibleTarget,
@@ -36,6 +37,7 @@ import {
   describeKindRoutes,
   describeDecision,
   firstAvailable,
+  kindCandidates,
   tierIndex,
   tierForModel,
   type AvailableModel,
@@ -54,6 +56,9 @@ interface Runtime {
   lastEntrySignature?: string;
   quota?: CodexQuotaCache;
   routeNotes: string[];
+  parked: Record<string, number>;
+  attempted: Set<string>;
+  failures: Map<string, number>;
 }
 
 const ACK_PATTERN = /^(y|yes|yeah|yep|ok|okay|sure|continue|go on|go ahead|do it|proceed|nice|thanks|thank you|ty)[.!]?$/i;
@@ -291,6 +296,10 @@ async function analyse(
     return { error: `missing API key (env ${config.apiKeyEnv})` };
   }
   if (runtime.models.length === 0) runtime.models = toAvailable(ctx);
+  if (config.recovery.enabled) runtime.parked = { ...runtime.parked, ...readParked(parkedPath(config.stateFile)) };
+  const models = config.recovery.enabled
+    ? runtime.models.filter((model) => !(runtime.parked[`${model.provider}/${model.id}`] > Date.now()))
+    : runtime.models;
   const spend = spendSnapshot(runtime.ledger, config.budget);
   // Context size prices the cache miss a switch would cause.
   const contextTokens = ctx.getContextUsage?.()?.tokens ?? undefined;
@@ -313,7 +322,7 @@ async function analyse(
   if (analysis.usage) recordJevUsage(runtime.ledger, analysis.usage.input_tokens, analysis.usage.output_tokens);
   saveLedger(config.stateFile, runtime.ledger);
   const decision = decide(analysis, config, {
-    models: runtime.models,
+    models,
     spend,
     contextTokens,
     eligibility: eligibilityFor(runtime),
@@ -321,7 +330,7 @@ async function analyse(
     current: {
       target: runtime.lastDecision?.model && `${runtime.lastDecision.model.provider}/${runtime.lastDecision.model.id}` === activeKey ? runtime.lastDecision.target : undefined,
       index: tierForModel(activeKey, config),
-      model: runtime.models.find((model) => `${model.provider}/${model.id}` === activeKey),
+      model: models.find((model) => `${model.provider}/${model.id}` === activeKey),
     },
   });
   return { analysis, decision };
@@ -582,6 +591,9 @@ export default async function jevRouterExtension(pi: ExtensionAPI): Promise<void
     ledger: loadLedger(loadConfig().stateFile),
     models: [],
     routeNotes: [],
+    parked: {},
+    attempted: new Set(),
+    failures: new Map(),
   };
 
   // Not every pi build/fork exposes the full ExtensionAPI surface. Detect the
@@ -642,6 +654,9 @@ export default async function jevRouterExtension(pi: ExtensionAPI): Promise<void
     runtime.config = loadConfig(ctx.cwd);
     runtime.ledger = loadLedger(runtime.config.stateFile);
     runtime.models = toAvailable(ctx);
+    runtime.parked = readParked(parkedPath(runtime.config.stateFile));
+    runtime.attempted.clear();
+    runtime.failures.clear();
     runtime.quota?.stop();
     runtime.quota = undefined;
     const quotaConfig = runtime.config.quota["openai-codex"];
@@ -697,6 +712,55 @@ export default async function jevRouterExtension(pi: ExtensionAPI): Promise<void
     }
   });
 
+  // Replay the existing user turn at the actionable boundary. A new user message
+  // would duplicate the prompt and a fresh Jev call could select the same dead model.
+  pi.on("turn_end", async (event, ctx) => {
+    if (!runtime.config.enabled || !runtime.config.recovery.enabled || runtime.config.mode === "notify") return;
+    const message = event.message;
+    if (message.role !== "assistant" || event.toolResults.length > 0) return;
+    if (message.stopReason !== "error") {
+      runtime.failures.clear();
+      return;
+    }
+    const failed = `${message.provider}/${message.model}`;
+    const failures = (runtime.failures.get(failed) ?? 0) + 1;
+    runtime.failures.set(failed, failures);
+    if (!modelUnavailable(message.errorMessage) &&
+        !(retryableProviderFailure(message.errorMessage) && failures > runtime.config.recovery.maxRetries)) return;
+    if (runtime.attempted.size >= 4 || runtime.attempted.has(failed)) return;
+    runtime.attempted.add(failed);
+    const expiry = Date.now() + runtime.config.recovery.parkMs;
+    runtime.parked[failed] = expiry;
+    try {
+      writeParked(parkedPath(runtime.config.stateFile), runtime.parked);
+    } catch {
+      notify(ctx, `jev-router: could not persist the park for ${failed}; it remains parked until this session ends`, "warning");
+    }
+    const knownTier = tierForModel(failed, runtime.config);
+    const ceiling = knownTier === undefined
+      ? 0
+      : Math.min(knownTier, runtime.lastDecision?.tierIndex ?? knownTier);
+    const candidates = [];
+    if (runtime.lastAnalysis) candidates.push(...kindCandidates(runtime.config, runtime.lastAnalysis.kind, ceiling));
+    for (let tier = ceiling; tier >= 0; tier -= 1) candidates.push(...runtime.config.routes[TIERS[tier]]);
+    if (runtime.config.free.enabled) candidates.push(...runtime.config.free.pool);
+    const models = runtime.models.filter((model) =>
+      !(runtime.parked[`${model.provider}/${model.id}`] > Date.now()) &&
+      !runtime.attempted.has(`${model.provider}/${model.id}`));
+    const fallback = firstAvailable(models, candidates, eligibilityFor(runtime));
+    if (!fallback || !await switchModel(fallback.model)) {
+      notify(ctx, `jev-router: ${failed} parked; no safe fallback for this turn`, "warning");
+      return;
+    }
+    if (fallback.target.thinkingLevel) setThinking(fallback.target.thinkingLevel);
+    runtime.lastDecision = runtime.lastDecision ? {
+      ...runtime.lastDecision, target: fallback.target, model: fallback.model,
+      tierIndex: Math.min(ceiling, tierForModel(`${fallback.model.provider}/${fallback.model.id}`, runtime.config) ?? ceiling),
+    } : undefined;
+    notify(ctx, `jev-router: ${failed} unavailable; parked and continuing this turn on ${fallback.model.provider}/${fallback.model.id}`, "warning");
+    return { entries: [{ type: "context_edit" as const, targetId: event.messageEntryId, replacement: null }], continue: true };
+  });
+
   // The routing hook: classify the prompt with Jev, then switch models in place.
   pi.on("input", async (event, ctx) => {
     if (!runtime.config.enabled) return { action: "continue" };
@@ -711,7 +775,10 @@ export default async function jevRouterExtension(pi: ExtensionAPI): Promise<void
     const text = event.text ?? "";
     const hasHistory = (historyExcerpt(ctx, 1)?.length ?? 0) > 0;
     const skip = shouldSkip(text, runtime.config, hasHistory);
-    if (skip) {
+    const parkedCurrent = runtime.config.recovery.enabled &&
+      (Math.max(runtime.parked[currentModelKey(ctx) ?? ""] ?? 0,
+        readParked(parkedPath(runtime.config.stateFile))[currentModelKey(ctx) ?? ""] ?? 0)) > Date.now();
+    if (skip && !parkedCurrent) {
       const notes: string[] = [];
       if (skip === "empty" || skip === "slash command" || currentQuotaAllowed(ctx, runtime, notes)) {
         if (notes.length) notify(ctx, notes.join("\n"), "warning");
@@ -721,29 +788,39 @@ export default async function jevRouterExtension(pi: ExtensionAPI): Promise<void
     }
 
     runtime.lastPrompt = text.trim();
+    runtime.attempted.clear();
+    runtime.failures.clear();
     setStatus(ctx, "jev-router:…");
     try {
       const result = await analyse(text, ctx, runtime);
       if ("error" in result) {
         statusLine(ctx, runtime);
         notify(ctx, `jev-router: ${result.error}`, "warning");
-        return { action: quotaBlocked(ctx, runtime, runtime.routeNotes) ? "handled" : "continue" };
+        if (parkedCurrent) notify(ctx, "jev-router: prompt not sent; current model is parked and no fallback could be selected", "warning");
+        return { action: parkedCurrent || quotaBlocked(ctx, runtime, runtime.routeNotes) ? "handled" : "continue" };
       }
       const { analysis, decision } = result;
       runtime.lastAnalysis = analysis;
       if (!decision) {
-        const blocked = quotaBlocked(ctx, runtime, runtime.routeNotes);
+        const blocked = parkedCurrent || quotaBlocked(ctx, runtime, runtime.routeNotes);
         appendSkipEntry("no route available", ctx, runtime, blocked);
-        if (runtime.routeNotes.length) notify(ctx, `jev-router: no eligible route\n${runtime.routeNotes.join("\n")}`, "warning");
+        if (parkedCurrent || runtime.routeNotes.length) notify(ctx, `jev-router: no eligible route; prompt not sent${runtime.routeNotes.length ? `\n${runtime.routeNotes.join("\n")}` : ""}`, "warning");
         statusLine(ctx, runtime);
         return { action: blocked ? "handled" : "continue" };
       }
       const applied = await applyDecision(analysis, decision, ctx, runtime);
-      if (applied.blocked) return { action: "handled" };
+      if (applied.blocked || (parkedCurrent && applied.action !== "switched" && applied.action !== "rerouted")) {
+        if (parkedCurrent && !applied.blocked) notify(ctx, "jev-router: prompt not sent; could not switch away from parked model", "warning");
+        return { action: "handled" };
+      }
     } catch (error) {
       statusLine(ctx, runtime);
       const message = error instanceof JevError ? error.message : error instanceof Error ? error.message : String(error);
       if (!/abort/i.test(message)) notify(ctx, `jev-router: ${message}`, "warning");
+      if (parkedCurrent) {
+        notify(ctx, "jev-router: prompt not sent; current model is parked and routing failed", "warning");
+        return { action: "handled" };
+      }
       if (quotaBlocked(ctx, runtime, runtime.routeNotes)) return { action: "handled" };
     }
     return { action: "continue" };
@@ -773,6 +850,22 @@ export default async function jevRouterExtension(pi: ExtensionAPI): Promise<void
           runtime.config.mode = mode;
           statusLine(ctx, runtime);
           notify(ctx, `jev-router mode: ${mode}`, "info");
+          return;
+        }
+        case "recovery": {
+          if (rest[0] === "clear") {
+            runtime.parked = {};
+            try {
+              writeParked(parkedPath(runtime.config.stateFile), {});
+            } catch {
+              notify(ctx, "jev-router: could not clear parked state on disk", "warning");
+              return;
+            }
+            notify(ctx, "jev-router: cleared parked models", "info");
+            return;
+          }
+          runtime.parked = readParked(parkedPath(runtime.config.stateFile));
+          notify(ctx, `recovery: ${runtime.config.recovery.enabled ? "on" : "off"}\nparked: ${Object.entries(runtime.parked).map(([key, until]) => `${key} until ${new Date(until).toISOString()}`).join(", ") || "none"}`, "info");
           return;
         }
         case "budget": {
@@ -893,6 +986,7 @@ export default async function jevRouterExtension(pi: ExtensionAPI): Promise<void
           const lines = [
             `enabled: ${runtime.config.enabled}`,
             `mode: ${runtime.config.mode}`,
+            `recovery: ${runtime.config.recovery.enabled ? "on" : "off"} (${Object.keys(readParked(parkedPath(runtime.config.stateFile))).length} parked)`,
             `jev model: ${runtime.config.jevModel}`,
             `api key: ${hasApiKey(runtime.config) ? `${runtime.config.apiKeyEnv} ✓` : "missing"}`,
             `current model: ${currentModelKey(ctx) ?? "unknown"}`,
@@ -925,7 +1019,7 @@ export default async function jevRouterExtension(pi: ExtensionAPI): Promise<void
             "",
             runtime.lastDecision ? `last: ${describeDecision(runtime.lastDecision)}` : "last: none",
             "",
-            "commands: /jev-router on|off|mode|budget|why|revert|suggest [--write] · /jev-route <text>",
+            "commands: /jev-router on|off|mode|recovery [clear]|budget|why|revert|suggest [--write] · /jev-route <text>",
           ];
           notify(ctx, lines.join("\n"), "info");
           return;
